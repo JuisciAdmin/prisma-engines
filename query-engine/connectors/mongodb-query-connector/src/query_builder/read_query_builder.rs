@@ -11,11 +11,13 @@ use crate::{
     root_queries::observing,
     vacuum_cursor,
 };
-use bson::{Document, doc};
+use bson::{Bson, Document, doc};
 use itertools::Itertools;
 use mongodb::{ClientSession, Collection, options::AggregateOptions};
 use query_structure::{
-    AggregationSelection, FieldSelection, Filter, Model, QueryArguments, ScalarFieldRef, Take, VirtualSelection,
+    AggregationSelection, ConditionValue, FieldSelection, Filter, Model, PrismaValue, QueryArguments, QueryMode,
+    ScalarCondition, ScalarFieldRef, ScalarProjection, Take, VirtualSelection,
+    self as qs,
 };
 use std::convert::TryFrom;
 use std::future::IntoFuture;
@@ -54,8 +56,13 @@ impl ReadQuery {
 pub(crate) struct MongoReadQueryBuilder {
     pub(crate) model: Model,
 
-    /// Pre-join, "normal" filters.
+    /// Pre-join, "normal" filters (aggregation expression syntax, wrapped in $expr).
     pub(crate) query: Option<Document>,
+
+    /// Native MongoDB query filter (standard MQL syntax, used directly in $match without $expr).
+    /// Takes precedence over `query` when set. Produced for simple scalar equality filters
+    /// that can bypass the aggregation expression path, allowing MongoDB to use indexes.
+    pub(crate) native_query: Option<Document>,
 
     /// Join stages.
     pub(crate) joins: Vec<JoinStage>,
@@ -110,6 +117,7 @@ impl MongoReadQueryBuilder {
         Self {
             model,
             query: None,
+            native_query: None,
             joins: vec![],
             join_filters: vec![],
             aggregations: vec![],
@@ -137,27 +145,35 @@ impl MongoReadQueryBuilder {
         let mut post_filters = vec![];
         let mut joins = vec![];
 
-        let query = match args.filter {
+        let (query, native_query) = match args.filter {
             Some(filter) => {
-                // If a filter comes with joins, it needs to be run _after_ the initial filter query / $matches.
-                let (filter, filter_joins) = MongoFilterVisitor::new(FilterPrefix::default(), false)
-                    .visit(filter)?
-                    .render();
-                if !filter_joins.is_empty() {
-                    joins.extend(filter_joins);
-                    post_filters.push(filter);
+                // Try to produce native MQL for simple scalar filters (enables index usage).
+                // Falls back to the aggregation expression visitor for complex filters.
+                match try_to_native_filter(&filter) {
+                    Some(native) => (None, Some(native)),
+                    None => {
+                        // If a filter comes with joins, it needs to be run _after_ the initial filter query / $matches.
+                        let (filter, filter_joins) = MongoFilterVisitor::new(FilterPrefix::default(), false)
+                            .visit(filter)?
+                            .render();
+                        if !filter_joins.is_empty() {
+                            joins.extend(filter_joins);
+                            post_filters.push(filter);
 
-                    None
-                } else {
-                    Some(filter)
+                            (None, None)
+                        } else {
+                            (Some(filter), None)
+                        }
+                    }
                 }
             }
-            None => None,
+            None => (None, None),
         };
 
         Ok(MongoReadQueryBuilder {
             model: args.model,
             query,
+            native_query,
             join_filters: post_filters,
             joins,
             order_builder,
@@ -196,8 +212,10 @@ impl MongoReadQueryBuilder {
     fn into_pipeline_stages(self) -> Vec<Document> {
         let mut stages = vec![];
 
-        // Initial $matches
-        if let Some(query) = self.query {
+        // Initial $matches — native MQL (index-friendly) takes precedence over $expr
+        if let Some(native) = self.native_query {
+            stages.push(doc! { "$match": native })
+        } else if let Some(query) = self.query {
             stages.push(doc! { "$match": { "$expr": query } })
         };
 
@@ -466,5 +484,63 @@ fn take(take: Take, ignore: bool) -> Option<i64> {
             Take::One | Take::NegativeOne => Some(1),
             Take::Some(n) => Some(n.abs()),
         }
+    }
+}
+
+/// Try to convert a Filter AST directly into native MongoDB query syntax.
+///
+/// Native MQL filters (`{ field: value }`) can be used in `$match` without `$expr`,
+/// allowing MongoDB to use indexes (IXSCAN) instead of full collection scans (COLLSCAN).
+///
+/// Returns `None` for filters that require aggregation expression syntax — those
+/// fall back to the existing `MongoFilterVisitor` + `$expr` path. This includes:
+/// joins, composites, array operators (hasSome/isEmpty/isSet), field references,
+/// case-insensitive mode, and null equality (where native MQL semantics differ).
+fn try_to_native_filter(filter: &Filter) -> Option<Document> {
+    match filter {
+        Filter::Scalar(sf) => try_scalar_to_native(sf),
+        Filter::And(filters) => {
+            let mut merged = Document::new();
+            for f in filters {
+                let native = try_to_native_filter(f)?;
+                for (key, value) in native {
+                    if merged.contains_key(&key) {
+                        // Same field appears twice in AND — can't merge into flat document
+                        return None;
+                    }
+                    merged.insert(key, value);
+                }
+            }
+            Some(merged)
+        }
+        Filter::Empty => Some(Document::new()),
+        _ => None,
+    }
+}
+
+/// Convert a single ScalarFilter to native MQL if it's a simple equality on a literal value.
+fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
+    // Case-insensitive mode uses $regex — not expressible as native equality
+    if sf.mode != QueryMode::Default {
+        return None;
+    }
+
+    let field: &ScalarFieldRef = match &sf.projection {
+        ScalarProjection::Single(f) => f,
+        ScalarProjection::Compound(_) => return None,
+    };
+
+    match &sf.condition {
+        ScalarCondition::Equals(ConditionValue::Value(pv)) => {
+            // Null equality has different semantics: native { field: null } matches
+            // both null AND missing documents, while $expr only matches explicit null.
+            // Fall back to $expr for null to preserve existing behavior.
+            if matches!(pv, PrismaValue::Null) {
+                return None;
+            }
+            let bson_val: Bson = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { field.db_name().to_string(): bson_val })
+        }
+        _ => None,
     }
 }
