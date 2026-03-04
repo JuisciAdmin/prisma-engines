@@ -15,10 +15,12 @@ use bson::{Bson, Document, doc};
 use itertools::Itertools;
 use mongodb::{ClientSession, Collection, options::AggregateOptions};
 use query_structure::{
-    AggregationSelection, ConditionValue, FieldSelection, Filter, Model, PrismaValue, QueryArguments, QueryMode,
-    ScalarCondition, ScalarFieldRef, ScalarProjection, Take, VirtualSelection,
+    AggregationSelection, ConditionListValue, ConditionValue, FieldSelection, Filter, Model, PrismaValue,
+    QueryArguments, QueryMode, ScalarCondition, ScalarFieldRef, ScalarListCondition, ScalarProjection, Take,
+    VirtualSelection,
     self as qs,
 };
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::future::IntoFuture;
 
@@ -499,28 +501,75 @@ fn take(take: Take, ignore: bool) -> Option<i64> {
 fn try_to_native_filter(filter: &Filter) -> Option<Document> {
     match filter {
         Filter::Scalar(sf) => try_scalar_to_native(sf),
+        Filter::ScalarList(slf) => try_scalar_list_to_native(slf),
         Filter::And(filters) => {
-            let mut merged = Document::new();
-            for f in filters {
-                let native = try_to_native_filter(f)?;
-                for (key, value) in native {
-                    if merged.contains_key(&key) {
-                        // Same field appears twice in AND — can't merge into flat document
-                        return None;
-                    }
-                    merged.insert(key, value);
-                }
+            let mut natives: Vec<Document> = filters
+                .iter()
+                .map(|f| try_to_native_filter(f))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .filter(|d| !d.is_empty())
+                .collect();
+
+            if natives.is_empty() {
+                return Some(Document::new());
             }
-            Some(merged)
+
+            if natives.len() == 1 {
+                return natives.pop();
+            }
+
+            if can_flatten_native_and(&natives) {
+                let mut merged = Document::new();
+                for native in natives {
+                    merged.extend(native);
+                }
+                Some(merged)
+            } else {
+                Some(doc! { "$and": natives })
+            }
+        }
+        Filter::Or(filters) => {
+            let natives: Vec<Document> = filters
+                .iter()
+                .map(|f| try_to_native_filter(f))
+                .collect::<Option<Vec<_>>>()?;
+            if natives.is_empty() {
+                return Some(Document::new());
+            }
+            Some(doc! { "$or": natives })
         }
         Filter::Empty => Some(Document::new()),
         _ => None,
     }
 }
 
-/// Convert a single ScalarFilter to native MQL if it's a simple equality on a literal value.
+/// Flat merge is only safe when each child document has distinct top-level
+/// field keys and no top-level operators (keys starting with `$`).
+fn can_flatten_native_and(natives: &[Document]) -> bool {
+    let mut seen = HashSet::new();
+
+    for native in natives {
+        for key in native.keys() {
+            if key.starts_with('$') {
+                return false;
+            }
+
+            if !seen.insert(key.as_str()) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Convert a single ScalarFilter to native MQL.
+///
+/// Handles: equality, comparisons, in/notIn, string ops (default mode), isSet.
+/// Returns None for: null values, field refs, case-insensitive mode, compound projections.
 fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
-    // Case-insensitive mode uses $regex — not expressible as native equality
+    // Case-insensitive mode uses $toLower in $expr — can't express natively
     if sf.mode != QueryMode::Default {
         return None;
     }
@@ -530,17 +579,152 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
         ScalarProjection::Compound(_) => return None,
     };
 
+    let name = field.db_name().to_string();
+
     match &sf.condition {
+        // === Equality ===
         ScalarCondition::Equals(ConditionValue::Value(pv)) => {
-            // Null equality has different semantics: native { field: null } matches
-            // both null AND missing documents, while $expr only matches explicit null.
-            // Fall back to $expr for null to preserve existing behavior.
+            // Null equality: native { field: null } matches both null AND missing,
+            // $expr only matches explicit null. Fall back to preserve behavior.
             if matches!(pv, PrismaValue::Null) {
                 return None;
             }
-            let bson_val: Bson = (field, pv.clone()).into_bson().ok()?;
-            Some(doc! { field.db_name().to_string(): bson_val })
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: v })
         }
+
+        // === NotEquals ===
+        // Native $ne includes docs where field is missing, but $expr excludes them.
+        // Add $exists guard to match $expr semantics.
+        ScalarCondition::NotEquals(ConditionValue::Value(pv)) => {
+            if matches!(pv, PrismaValue::Null) {
+                return None;
+            }
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { "$and": [
+                { &name: { "$exists": true } },
+                { &name: { "$ne": v } }
+            ] })
+        }
+
+        // === Comparison operators ===
+        ScalarCondition::LessThan(ConditionValue::Value(pv)) => {
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: { "$lt": v } })
+        }
+        ScalarCondition::LessThanOrEquals(ConditionValue::Value(pv)) => {
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: { "$lte": v } })
+        }
+        ScalarCondition::GreaterThan(ConditionValue::Value(pv)) => {
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: { "$gt": v } })
+        }
+        ScalarCondition::GreaterThanOrEquals(ConditionValue::Value(pv)) => {
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: { "$gte": v } })
+        }
+
+        // === In ===
+        ScalarCondition::In(ConditionListValue::List(vals)) => {
+            // Bail if any null values — native $in with null matches missing docs too
+            if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
+                return None;
+            }
+            let arr: Vec<Bson> = vals
+                .iter()
+                .map(|v| (field, v.clone()).into_bson())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            Some(doc! { &name: { "$in": arr } })
+        }
+
+        // === NotIn ===
+        // Same $exists guard as NotEquals — native $nin includes missing docs.
+        ScalarCondition::NotIn(ConditionListValue::List(vals)) => {
+            if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
+                return None;
+            }
+            let arr: Vec<Bson> = vals
+                .iter()
+                .map(|v| (field, v.clone()).into_bson())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            Some(doc! { "$and": [
+                { &name: { "$exists": true } },
+                { &name: { "$nin": arr } }
+            ] })
+        }
+
+        // === String operations (default mode only) ===
+        ScalarCondition::StartsWith(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { &name: { "$regex": format!("^{}", regex::escape(s)) } })
+        }
+        ScalarCondition::EndsWith(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { &name: { "$regex": format!("{}$", regex::escape(s)) } })
+        }
+        ScalarCondition::Contains(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { &name: { "$regex": regex::escape(s) } })
+        }
+
+        // === IsSet ===
+        ScalarCondition::IsSet(is_set) => {
+            Some(doc! { &name: { "$exists": *is_set } })
+        }
+
+        // Everything else (field refs, null, negative string ops, JSON, search) → $expr
+        _ => None,
+    }
+}
+
+/// Convert a ScalarListFilter (array field operations) to native MQL.
+///
+/// Handles: has (Contains), hasSome (ContainsSome), hasEvery (ContainsEvery), isEmpty.
+fn try_scalar_list_to_native(slf: &qs::ScalarListFilter) -> Option<Document> {
+    let field = &slf.field;
+    let name = field.db_name().to_string();
+
+    match &slf.condition {
+        // has: value → { field: value } (MongoDB matches if array contains element)
+        ScalarListCondition::Contains(ConditionValue::Value(pv)) => {
+            let v = (field, pv.clone()).into_bson().ok()?;
+            Some(doc! { &name: v })
+        }
+
+        // hasSome: [...] → { field: { $in: [...] } }
+        ScalarListCondition::ContainsSome(ConditionListValue::List(vals)) if !vals.is_empty() => {
+            let arr: Vec<Bson> = vals
+                .iter()
+                .map(|v| (field, v.clone()).into_bson())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            Some(doc! { &name: { "$in": arr } })
+        }
+
+        // hasEvery: [...] → { field: { $all: [...] } }
+        ScalarListCondition::ContainsEvery(ConditionListValue::List(vals)) if !vals.is_empty() => {
+            let arr: Vec<Bson> = vals
+                .iter()
+                .map(|v| (field, v.clone()).into_bson())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            Some(doc! { &name: { "$all": arr } })
+        }
+
+        // isEmpty: true → { field: { $size: 0 } }
+        ScalarListCondition::IsEmpty(true) => {
+            Some(doc! { &name: { "$size": 0_i32 } })
+        }
+
+        // isEmpty: false → { "field.0": { $exists: true } }
+        ScalarListCondition::IsEmpty(false) => {
+            Some(doc! { format!("{}.0", &name): { "$exists": true } })
+        }
+
+        // FieldRef variants, empty lists → fall back to $expr
         _ => None,
     }
 }
