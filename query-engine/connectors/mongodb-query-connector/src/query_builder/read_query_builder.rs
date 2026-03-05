@@ -598,7 +598,12 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
         // Add $exists guard to match $expr semantics.
         ScalarCondition::NotEquals(ConditionValue::Value(pv)) => {
             if matches!(pv, PrismaValue::Null) {
-                return None;
+                // Prisma's `not: null` should exclude both explicit null and missing fields.
+                // Native `$ne: null` alone would include missing docs, so keep the `$exists` guard.
+                return Some(doc! { "$and": [
+                    { &name: { "$exists": true } },
+                    { &name: { "$ne": Bson::Null } }
+                ] });
             }
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { "$and": [
@@ -669,13 +674,34 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
             let s = pv.as_string()?;
             Some(doc! { &name: { "$regex": regex::escape(s) } })
         }
+        ScalarCondition::NotStartsWith(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { "$and": [
+                { &name: { "$exists": true } },
+                { &name: { "$not": { "$regex": format!("^{}", regex::escape(s)) } } }
+            ] })
+        }
+        ScalarCondition::NotEndsWith(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { "$and": [
+                { &name: { "$exists": true } },
+                { &name: { "$not": { "$regex": format!("{}$", regex::escape(s)) } } }
+            ] })
+        }
+        ScalarCondition::NotContains(ConditionValue::Value(pv)) => {
+            let s = pv.as_string()?;
+            Some(doc! { "$and": [
+                { &name: { "$exists": true } },
+                { &name: { "$not": { "$regex": regex::escape(s) } } }
+            ] })
+        }
 
         // === IsSet ===
         ScalarCondition::IsSet(is_set) => {
             Some(doc! { &name: { "$exists": *is_set } })
         }
 
-        // Everything else (field refs, null, negative string ops, JSON, search) → $expr
+        // Everything else (field refs, null equality, JSON, search) → $expr
         _ => None,
     }
 }
