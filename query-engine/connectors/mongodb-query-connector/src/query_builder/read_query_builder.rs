@@ -517,7 +517,7 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                 .collect();
 
             if natives.is_empty() {
-                return Some(Document::new());
+                return Some(native_true_filter());
             }
 
             if natives.len() == 1 {
@@ -539,9 +539,21 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                 .iter()
                 .map(|f| try_to_native_filter_with_prefix(f, path_prefix))
                 .collect::<Option<Vec<_>>>()?;
+
             if natives.is_empty() {
-                return Some(Document::new());
+                // OR([]) is always false.
+                return Some(native_false_filter());
             }
+
+            // OR([true, ...]) is always true.
+            if natives.iter().any(|d| d.is_empty()) {
+                return Some(native_true_filter());
+            }
+
+            if natives.len() == 1 {
+                return natives.into_iter().next();
+            }
+
             Some(doc! { "$or": natives })
         }
         Filter::Not(filters) => {
@@ -549,9 +561,11 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                 .iter()
                 .map(|f| try_to_native_filter_with_prefix(f, path_prefix))
                 .collect::<Option<Vec<_>>>()?;
+
             if natives.is_empty() {
-                return Some(Document::new());
+                return Some(native_true_filter());
             }
+
             Some(doc! { "$nor": natives })
         }
         Filter::Composite(cf) => {
@@ -828,4 +842,12 @@ fn regex_filter_doc(pattern: String, insensitive: bool) -> Document {
     } else {
         doc! { "$regex": pattern }
     }
+}
+
+fn native_true_filter() -> Document {
+    Document::new()
+}
+
+fn native_false_filter() -> Document {
+    doc! { "$nor": [Document::new()] }
 }
