@@ -15,10 +15,9 @@ use bson::{Bson, Document, doc};
 use itertools::Itertools;
 use mongodb::{ClientSession, Collection, options::AggregateOptions};
 use query_structure::{
-    AggregationSelection, ConditionListValue, ConditionValue, FieldSelection, Filter, Model, PrismaValue,
-    QueryArguments, QueryMode, ScalarCondition, ScalarFieldRef, ScalarListCondition, ScalarProjection, Take,
-    VirtualSelection,
-    self as qs,
+    self as qs, AggregationSelection, CompositeCondition, ConditionListValue, ConditionValue, FieldSelection, Filter,
+    Model, PrismaValue, QueryArguments, QueryMode, ScalarCondition, ScalarFieldRef, ScalarListCondition,
+    ScalarProjection, Take, VirtualSelection,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -489,23 +488,29 @@ fn take(take: Take, ignore: bool) -> Option<i64> {
     }
 }
 
+/// Public helper for write paths that want to reuse the same native translation
+/// used by read query argument translation.
+pub(crate) fn try_filter_to_native_mql(filter: &Filter) -> Option<Document> {
+    try_to_native_filter(filter)
+}
+
 /// Try to convert a Filter AST directly into native MongoDB query syntax.
 ///
 /// Native MQL filters (`{ field: value }`) can be used in `$match` without `$expr`,
 /// allowing MongoDB to use indexes (IXSCAN) instead of full collection scans (COLLSCAN).
 ///
-/// Returns `None` for filters that require aggregation expression syntax — those
-/// fall back to the existing `MongoFilterVisitor` + `$expr` path. This includes:
-/// joins, composites, array operators (hasSome/isEmpty/isSet), field references,
-/// case-insensitive mode, and null equality (where native MQL semantics differ).
 fn try_to_native_filter(filter: &Filter) -> Option<Document> {
+    try_to_native_filter_with_prefix(filter, None)
+}
+
+fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) -> Option<Document> {
     match filter {
-        Filter::Scalar(sf) => try_scalar_to_native(sf),
-        Filter::ScalarList(slf) => try_scalar_list_to_native(slf),
+        Filter::Scalar(sf) => try_scalar_to_native(sf, path_prefix),
+        Filter::ScalarList(slf) => try_scalar_list_to_native(slf, path_prefix),
         Filter::And(filters) => {
             let mut natives: Vec<Document> = filters
                 .iter()
-                .map(|f| try_to_native_filter(f))
+                .map(|f| try_to_native_filter_with_prefix(f, path_prefix))
                 .collect::<Option<Vec<_>>>()?
                 .into_iter()
                 .filter(|d| !d.is_empty())
@@ -532,12 +537,34 @@ fn try_to_native_filter(filter: &Filter) -> Option<Document> {
         Filter::Or(filters) => {
             let natives: Vec<Document> = filters
                 .iter()
-                .map(|f| try_to_native_filter(f))
+                .map(|f| try_to_native_filter_with_prefix(f, path_prefix))
                 .collect::<Option<Vec<_>>>()?;
             if natives.is_empty() {
                 return Some(Document::new());
             }
             Some(doc! { "$or": natives })
+        }
+        Filter::Not(filters) => {
+            let natives: Vec<Document> = filters
+                .iter()
+                .map(|f| try_to_native_filter_with_prefix(f, path_prefix))
+                .collect::<Option<Vec<_>>>()?;
+            if natives.is_empty() {
+                return Some(Document::new());
+            }
+            Some(doc! { "$nor": natives })
+        }
+        Filter::Composite(cf) => {
+            let nested_prefix = join_field_path(path_prefix, cf.field.db_name());
+            match cf.condition.as_ref() {
+                CompositeCondition::Is(inner) => try_to_native_filter_with_prefix(inner, Some(nested_prefix.as_str())),
+                CompositeCondition::IsNot(inner) => {
+                    let nested = try_to_native_filter_with_prefix(inner, Some(nested_prefix.as_str()))?;
+                    Some(doc! { "$nor": [nested] })
+                }
+                CompositeCondition::IsSet(is_set) => Some(doc! { nested_prefix: { "$exists": *is_set } }),
+                _ => None,
+            }
         }
         Filter::Empty => Some(Document::new()),
         _ => None,
@@ -566,29 +593,41 @@ fn can_flatten_native_and(natives: &[Document]) -> bool {
 
 /// Convert a single ScalarFilter to native MQL.
 ///
-/// Handles: equality, comparisons, in/notIn, string ops (default mode), isSet.
-/// Returns None for: null values, field refs, case-insensitive mode, compound projections.
-fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
-    // Case-insensitive mode uses $toLower in $expr — can't express natively
-    if sf.mode != QueryMode::Default {
-        return None;
-    }
-
+/// Handles: equality, comparisons, in/notIn, string ops, isSet.
+/// Returns None for: field refs, complex/unsupported compound projections and JSON/search conditions.
+fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Option<Document> {
     let field: &ScalarFieldRef = match &sf.projection {
         ScalarProjection::Single(f) => f,
         ScalarProjection::Compound(_) => return None,
     };
 
-    let name = field.db_name().to_string();
+    let name = join_field_path(path_prefix, field.db_name());
+    let insensitive = sf.mode == QueryMode::Insensitive;
+
+    // Only support known query modes.
+    if !matches!(sf.mode, QueryMode::Default | QueryMode::Insensitive) {
+        return None;
+    }
 
     match &sf.condition {
         // === Equality ===
         ScalarCondition::Equals(ConditionValue::Value(pv)) => {
-            // Null equality: native { field: null } matches both null AND missing,
-            // $expr only matches explicit null. Fall back to preserve behavior.
             if matches!(pv, PrismaValue::Null) {
-                return None;
+                // Prisma null equality excludes missing fields. Native { field: null }
+                // includes missing fields, so keep an explicit $exists guard.
+                return Some(doc! { "$and": [
+                    { &name: { "$exists": true } },
+                    { &name: Bson::Null }
+                ] });
             }
+
+            if insensitive {
+                let s = pv.as_string()?;
+                return Some(doc! {
+                    &name: regex_filter_doc(format!("^{}$", regex::escape(s)), true)
+                });
+            }
+
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { &name: v })
         }
@@ -605,6 +644,15 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
                     { &name: { "$ne": Bson::Null } }
                 ] });
             }
+
+            if insensitive {
+                let s = pv.as_string()?;
+                return Some(doc! { "$and": [
+                    { &name: { "$exists": true } },
+                    { &name: { "$not": regex_filter_doc(format!("^{}$", regex::escape(s)), true) } }
+                ] });
+            }
+
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { "$and": [
                 { &name: { "$exists": true } },
@@ -614,24 +662,39 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
 
         // === Comparison operators ===
         ScalarCondition::LessThan(ConditionValue::Value(pv)) => {
+            if insensitive {
+                return None;
+            }
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { &name: { "$lt": v } })
         }
         ScalarCondition::LessThanOrEquals(ConditionValue::Value(pv)) => {
+            if insensitive {
+                return None;
+            }
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { &name: { "$lte": v } })
         }
         ScalarCondition::GreaterThan(ConditionValue::Value(pv)) => {
+            if insensitive {
+                return None;
+            }
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { &name: { "$gt": v } })
         }
         ScalarCondition::GreaterThanOrEquals(ConditionValue::Value(pv)) => {
+            if insensitive {
+                return None;
+            }
             let v = (field, pv.clone()).into_bson().ok()?;
             Some(doc! { &name: { "$gte": v } })
         }
 
         // === In ===
         ScalarCondition::In(ConditionListValue::List(vals)) => {
+            if insensitive {
+                return None;
+            }
             // Bail if any null values — native $in with null matches missing docs too
             if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
                 return None;
@@ -647,6 +710,9 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
         // === NotIn ===
         // Same $exists guard as NotEquals — native $nin includes missing docs.
         ScalarCondition::NotIn(ConditionListValue::List(vals)) => {
+            if insensitive {
+                return None;
+            }
             if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
                 return None;
             }
@@ -661,47 +727,45 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
             ] })
         }
 
-        // === String operations (default mode only) ===
+        // === String operations ===
         ScalarCondition::StartsWith(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
-            Some(doc! { &name: { "$regex": format!("^{}", regex::escape(s)) } })
+            Some(doc! { &name: regex_filter_doc(format!("^{}", regex::escape(s)), insensitive) })
         }
         ScalarCondition::EndsWith(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
-            Some(doc! { &name: { "$regex": format!("{}$", regex::escape(s)) } })
+            Some(doc! { &name: regex_filter_doc(format!("{}$", regex::escape(s)), insensitive) })
         }
         ScalarCondition::Contains(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
-            Some(doc! { &name: { "$regex": regex::escape(s) } })
+            Some(doc! { &name: regex_filter_doc(regex::escape(s), insensitive) })
         }
         ScalarCondition::NotStartsWith(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
             Some(doc! { "$and": [
                 { &name: { "$exists": true } },
-                { &name: { "$not": { "$regex": format!("^{}", regex::escape(s)) } } }
+                { &name: { "$not": regex_filter_doc(format!("^{}", regex::escape(s)), insensitive) } }
             ] })
         }
         ScalarCondition::NotEndsWith(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
             Some(doc! { "$and": [
                 { &name: { "$exists": true } },
-                { &name: { "$not": { "$regex": format!("{}$", regex::escape(s)) } } }
+                { &name: { "$not": regex_filter_doc(format!("{}$", regex::escape(s)), insensitive) } }
             ] })
         }
         ScalarCondition::NotContains(ConditionValue::Value(pv)) => {
             let s = pv.as_string()?;
             Some(doc! { "$and": [
                 { &name: { "$exists": true } },
-                { &name: { "$not": { "$regex": regex::escape(s) } } }
+                { &name: { "$not": regex_filter_doc(regex::escape(s), insensitive) } }
             ] })
         }
 
         // === IsSet ===
-        ScalarCondition::IsSet(is_set) => {
-            Some(doc! { &name: { "$exists": *is_set } })
-        }
+        ScalarCondition::IsSet(is_set) => Some(doc! { &name: { "$exists": *is_set } }),
 
-        // Everything else (field refs, null equality, JSON, search) → $expr
+        // Everything else (field refs, JSON, search) → $expr
         _ => None,
     }
 }
@@ -709,9 +773,9 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter) -> Option<Document> {
 /// Convert a ScalarListFilter (array field operations) to native MQL.
 ///
 /// Handles: has (Contains), hasSome (ContainsSome), hasEvery (ContainsEvery), isEmpty.
-fn try_scalar_list_to_native(slf: &qs::ScalarListFilter) -> Option<Document> {
+fn try_scalar_list_to_native(slf: &qs::ScalarListFilter, path_prefix: Option<&str>) -> Option<Document> {
     let field = &slf.field;
-    let name = field.db_name().to_string();
+    let name = join_field_path(path_prefix, field.db_name());
 
     match &slf.condition {
         // has: value → { field: value } (MongoDB matches if array contains element)
@@ -741,16 +805,27 @@ fn try_scalar_list_to_native(slf: &qs::ScalarListFilter) -> Option<Document> {
         }
 
         // isEmpty: true → { field: { $size: 0 } }
-        ScalarListCondition::IsEmpty(true) => {
-            Some(doc! { &name: { "$size": 0_i32 } })
-        }
+        ScalarListCondition::IsEmpty(true) => Some(doc! { &name: { "$size": 0_i32 } }),
 
         // isEmpty: false → { "field.0": { $exists: true } }
-        ScalarListCondition::IsEmpty(false) => {
-            Some(doc! { format!("{}.0", &name): { "$exists": true } })
-        }
+        ScalarListCondition::IsEmpty(false) => Some(doc! { format!("{}.0", &name): { "$exists": true } }),
 
         // FieldRef variants, empty lists → fall back to $expr
         _ => None,
+    }
+}
+
+fn join_field_path(path_prefix: Option<&str>, field_name: &str) -> String {
+    match path_prefix {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}.{field_name}"),
+        _ => field_name.to_string(),
+    }
+}
+
+fn regex_filter_doc(pattern: String, insensitive: bool) -> Document {
+    if insensitive {
+        doc! { "$regex": pattern, "$options": "i" }
+    } else {
+        doc! { "$regex": pattern }
     }
 }

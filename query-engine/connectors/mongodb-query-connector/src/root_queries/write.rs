@@ -5,7 +5,7 @@ use crate::{
     error::{DecorateErrorWithFieldInformationExtension, MongoError},
     filter::{FilterPrefix, MongoFilter, MongoFilterVisitor},
     output_meta,
-    query_builder::MongoReadQueryBuilder,
+    query_builder::{MongoReadQueryBuilder, try_filter_to_native_mql},
     query_strings::{Aggregate, DeleteMany, DeleteOne, Find, InsertMany, InsertOne, RunCommand, UpdateMany, UpdateOne},
     root_queries::raw::{MongoCommand, MongoOperation},
 };
@@ -171,6 +171,8 @@ pub async fn update_records(
                     .decorate_with_scalar_field_info(&id_field)
             })
             .collect::<crate::Result<Vec<_>>>()?
+    } else if let Some(filter) = try_filter_to_native_mql(&record_filter.filter) {
+        find_ids_native(coll.clone(), session, model, filter, None).await?
     } else {
         let filter = MongoFilterVisitor::new(FilterPrefix::default(), false).visit(record_filter.filter)?;
         find_ids(coll.clone(), session, model, filter, None).await?
@@ -248,6 +250,8 @@ pub async fn delete_records(
                     .decorate_with_scalar_field_info(&id_field)
             })
             .collect::<crate::Result<Vec<_>>>()?
+    } else if let Some(filter) = try_filter_to_native_mql(&record_filter.filter) {
+        find_ids_native(coll.clone(), session, model, filter, limit).await?
     } else {
         let filter = MongoFilterVisitor::new(FilterPrefix::default(), false).visit(record_filter.filter)?;
         find_ids(coll.clone(), session, model, filter, limit).await?
@@ -275,18 +279,30 @@ pub async fn delete_record(
     selected_fields: FieldSelection,
 ) -> crate::Result<SingleRecord> {
     let coll = database.collection::<Document>(model.db_name());
-    let (filter, joins) = MongoFilterVisitor::new(FilterPrefix::default(), false)
-        .visit(record_filter.filter)?
-        .render();
-    debug_assert!(
-        joins.is_empty(),
-        "filter should not contain any predicates on relations"
-    );
+    let id_field = pick_singular_id(model);
 
-    // All filters use `aggregate` command syntax by default. To use rendered expression in `find*`
-    // command family, it needs to be wrapped in `$expr`.
-    let filter = doc! {
-        "$expr": filter,
+    let filter = if let Some(selector) = record_filter
+        .selectors
+        .and_then(|selectors| selectors.into_iter().next())
+    {
+        let id = (&id_field, selector.values().next().unwrap())
+            .into_bson()
+            .decorate_with_scalar_field_info(&id_field)?;
+        doc! { id_field.db_name(): id }
+    } else if let Some(filter) = try_filter_to_native_mql(&record_filter.filter) {
+        filter
+    } else {
+        let (filter, joins) = MongoFilterVisitor::new(FilterPrefix::default(), false)
+            .visit(record_filter.filter)?
+            .render();
+        debug_assert!(
+            joins.is_empty(),
+            "filter should not contain any predicates on relations"
+        );
+
+        // All filters use `aggregate` command syntax by default. To use rendered expression in `find*`
+        // command family, it needs to be wrapped in `$expr`.
+        doc! { "$expr": filter }
     };
 
     let query_string_builder = DeleteOne::new(&filter, coll.name());
@@ -323,6 +339,39 @@ async fn find_ids(
     } else {
         builder.query = Some(filter);
     };
+
+    let mut builder = builder.with_model_projection(id_field)?;
+
+    if let Some(limit) = limit {
+        builder.limit = match i64::try_from(limit) {
+            Ok(limit) => Some(limit),
+            Err(_) => {
+                return Err(ConversionError {
+                    from: "usize".to_owned(),
+                    to: "i64".to_owned(),
+                });
+            }
+        }
+    }
+
+    let query = builder.build()?;
+    let docs = query.execute(collection, session).await?;
+    let ids = docs.into_iter().map(|mut doc| doc.remove("_id").unwrap()).collect();
+
+    Ok(ids)
+}
+
+/// Retrives document ids based on the given native MongoDB filter.
+async fn find_ids_native(
+    collection: Collection<Document>,
+    session: &mut ClientSession,
+    model: &Model,
+    filter: Document,
+    limit: Option<usize>,
+) -> crate::Result<Vec<Bson>> {
+    let id_field = model.primary_identifier();
+    let mut builder = MongoReadQueryBuilder::new(model.clone());
+    builder.native_query = Some(filter);
 
     let mut builder = builder.with_model_projection(id_field)?;
 
