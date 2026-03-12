@@ -153,8 +153,16 @@ impl MongoFilterVisitor {
         let field_name = (self.prefix(), field).into_bson()?;
         let field_ref = condition.as_field_ref().cloned();
         let is_set_cond = matches!(&condition, ScalarCondition::IsSet(_));
+        let is_null_equality = matches!(&condition, ScalarCondition::Equals(ConditionValue::Value(pv)) if matches!(pv, PrismaValue::Null));
 
         let filter_doc = match condition {
+            // Null equality: match both explicit null AND missing ($$REMOVE)
+            ScalarCondition::Equals(ConditionValue::Value(PrismaValue::Null)) => {
+                doc! { "$or": [
+                    { "$eq": [&field_name, Bson::Null] },
+                    { "$eq": [&field_name, "$$REMOVE"] }
+                ] }
+            }
             ScalarCondition::Equals(val) => {
                 doc! { "$eq": [&field_name, self.coerce_to_bson_for_filter(field, val)?] }
             }
@@ -272,7 +280,7 @@ impl MongoFilterVisitor {
             ScalarCondition::NotSearch(_, _) => unimplemented!("Full-text search is not supported yet on MongoDB"),
         };
 
-        let filter_doc = if !is_set_cond {
+        let filter_doc = if !is_set_cond && !is_null_equality {
             exclude_undefineds(&field_name, self.invert_undefined_exclusion(), filter_doc)
         } else {
             filter_doc

@@ -627,12 +627,9 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Opt
         // === Equality ===
         ScalarCondition::Equals(ConditionValue::Value(pv)) => {
             if matches!(pv, PrismaValue::Null) {
-                // Prisma null equality excludes missing fields. Native { field: null }
-                // includes missing fields, so keep an explicit $exists guard.
-                return Some(doc! { "$and": [
-                    { &name: { "$exists": true } },
-                    { &name: Bson::Null }
-                ] });
+                // Native MongoDB: { field: null } matches both explicit null AND missing.
+                // This is the desired Prisma semantics — no $exists guard needed.
+                return Some(doc! { &name: Bson::Null });
             }
 
             if insensitive {
@@ -709,10 +706,7 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Opt
             if insensitive {
                 return None;
             }
-            // Bail if any null values — native $in with null matches missing docs too
-            if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
-                return None;
-            }
+            // Native $in with null matches both null + missing — desired semantics.
             let arr: Vec<Bson> = vals
                 .iter()
                 .map(|v| (field, v.clone()).into_bson())
