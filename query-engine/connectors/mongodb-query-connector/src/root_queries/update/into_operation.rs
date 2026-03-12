@@ -30,19 +30,19 @@ impl IntoUpdateOperation for ScalarWriteOperation {
             )),
             ScalarWriteOperation::Add(rhs) => Some(UpdateOperation::generic(
                 field_path,
-                doc! { "$add": [dollar_field_path, (field, rhs).into_bson()?] },
+                doc! { "$add": [{ "$ifNull": [dollar_field_path, 0] }, (field, rhs).into_bson()?] },
             )),
             ScalarWriteOperation::Subtract(rhs) => Some(UpdateOperation::generic(
                 field_path,
-                doc! { "$subtract": [dollar_field_path, (field, rhs).into_bson()?] },
+                doc! { "$subtract": [{ "$ifNull": [dollar_field_path, 0] }, (field, rhs).into_bson()?] },
             )),
             ScalarWriteOperation::Multiply(rhs) => Some(UpdateOperation::generic(
                 field_path,
-                doc! { "$multiply": [dollar_field_path, (field, rhs).into_bson()?] },
+                doc! { "$multiply": [{ "$ifNull": [dollar_field_path, 0] }, (field, rhs).into_bson()?] },
             )),
             ScalarWriteOperation::Divide(rhs) => Some(UpdateOperation::generic(
                 field_path,
-                doc! { "$divide": [dollar_field_path, (field, rhs).into_bson()?] },
+                doc! { "$divide": [{ "$ifNull": [dollar_field_path, 0] }, (field, rhs).into_bson()?] },
             )),
             ScalarWriteOperation::Unset(true) => Some(UpdateOperation::unset(field_path)),
             ScalarWriteOperation::Unset(false) => None,
