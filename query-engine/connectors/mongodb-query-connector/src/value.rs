@@ -422,8 +422,12 @@ fn read_composite_value(bson: Bson, meta: &CompositeOutputMeta) -> crate::Result
                             let value = value_from_bson(value, meta)?;
                             pairs.push((field.clone(), value))
                         }
-                        // Coerce missing scalar lists as empty lists
+                        // Coerce missing composite lists as empty lists
                         (None, OutputMeta::Composite(meta)) if meta.list => {
+                            pairs.push((field.clone(), PrismaValue::List(Vec::new())))
+                        }
+                        // Coerce missing scalar lists as empty lists (fix #9)
+                        (None, OutputMeta::Scalar(meta)) if meta.list => {
                             pairs.push((field.clone(), PrismaValue::List(Vec::new())))
                         }
                         // Coerce missing scalars with their default values
