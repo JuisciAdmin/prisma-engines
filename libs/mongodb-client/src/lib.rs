@@ -3,6 +3,7 @@ mod error;
 pub use error::*;
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use mongodb::{
     Client,
@@ -11,8 +12,16 @@ use mongodb::{
 
 /// A wrapper to create a new MongoDB client. Please remove me when we do not
 /// need special setup anymore for this.
-pub async fn create(connection_string: impl AsRef<str>) -> Result<Client, Error> {
-    let mut connection_string_parser = ClientOptions::parse(connection_string.as_ref());
+///
+/// If the connection string contains a `maxTimeMS=<N>` query parameter, it is
+/// extracted and returned as an `Option<Duration>`. The parameter is stripped
+/// from the URL before passing it to the driver (it is not a standard driver
+/// option).
+pub async fn create(connection_string: impl AsRef<str>) -> Result<(Client, Option<Duration>), Error> {
+    let raw_url = connection_string.as_ref();
+    let (clean_url, max_time) = extract_max_time_ms(raw_url);
+
+    let mut connection_string_parser = ClientOptions::parse(&clean_url);
     if cfg!(target_os = "windows") {
         connection_string_parser = connection_string_parser.resolver_config(ResolverConfig::cloudflare());
     }
@@ -20,7 +29,42 @@ pub async fn create(connection_string: impl AsRef<str>) -> Result<Client, Error>
     let mut options = connection_string_parser.await?;
     options.driver_info = Some(DriverInfo::builder().name("Prisma").build());
 
-    Ok(Client::with_options(options)?)
+    Ok((Client::with_options(options)?, max_time))
+}
+
+/// Extract `maxTimeMS=<N>` from a MongoDB connection string's query parameters.
+/// Returns the cleaned URL (with `maxTimeMS` removed) and the parsed Duration.
+fn extract_max_time_ms(url: &str) -> (String, Option<Duration>) {
+    let Some(q_pos) = url.find('?') else {
+        return (url.to_owned(), None);
+    };
+
+    let (base, query_with_q) = url.split_at(q_pos);
+    let query_str = &query_with_q[1..];
+
+    let mut max_time_ms: Option<u64> = None;
+    let mut other_params = Vec::new();
+
+    for param in query_str.split('&') {
+        if let Some(value) = param.strip_prefix("maxTimeMS=") {
+            if let Ok(ms) = value.parse::<u64>() {
+                max_time_ms = Some(ms);
+            } else {
+                // Keep malformed maxTimeMS so the driver can report the error.
+                other_params.push(param);
+            }
+        } else {
+            other_params.push(param);
+        }
+    }
+
+    let clean_url = if other_params.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{}?{}", base, other_params.join("&"))
+    };
+
+    (clean_url, max_time_ms.map(Duration::from_millis))
 }
 
 /// The parts we need taken from `mongodb` private functions. Please remove everything after me
@@ -225,6 +269,45 @@ fn percent_decode(s: &str, err_message: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use crate::MongoConnectionString;
+    use std::time::Duration;
+
+    use super::extract_max_time_ms;
+
+    #[test]
+    fn max_time_ms_extracted() {
+        let (clean, max_time) = extract_max_time_ms("mongodb://localhost/test?maxTimeMS=5000&retryWrites=true");
+        assert_eq!(clean, "mongodb://localhost/test?retryWrites=true");
+        assert_eq!(max_time, Some(Duration::from_millis(5000)));
+    }
+
+    #[test]
+    fn max_time_ms_absent() {
+        let (clean, max_time) = extract_max_time_ms("mongodb://localhost/test?retryWrites=true");
+        assert_eq!(clean, "mongodb://localhost/test?retryWrites=true");
+        assert_eq!(max_time, None);
+    }
+
+    #[test]
+    fn max_time_ms_only_param() {
+        let (clean, max_time) = extract_max_time_ms("mongodb://localhost/test?maxTimeMS=30000");
+        assert_eq!(clean, "mongodb://localhost/test");
+        assert_eq!(max_time, Some(Duration::from_millis(30000)));
+    }
+
+    #[test]
+    fn max_time_ms_no_query_string() {
+        let (clean, max_time) = extract_max_time_ms("mongodb://localhost/test");
+        assert_eq!(clean, "mongodb://localhost/test");
+        assert_eq!(max_time, None);
+    }
+
+    #[test]
+    fn max_time_ms_middle_of_params() {
+        let (clean, max_time) =
+            extract_max_time_ms("mongodb://localhost/test?retryWrites=true&maxTimeMS=10000&w=majority");
+        assert_eq!(clean, "mongodb://localhost/test?retryWrites=true&w=majority");
+        assert_eq!(max_time, Some(Duration::from_millis(10000)));
+    }
 
     #[test]
     fn only_host() {

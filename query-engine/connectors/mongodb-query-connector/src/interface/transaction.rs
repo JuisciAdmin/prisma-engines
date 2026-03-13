@@ -138,6 +138,7 @@ impl WriteOperations for MongoDbTransaction<'_> {
                 record_filter,
                 args,
                 UpdateType::Many { limit },
+                self.connection.max_time,
             )
             .await?;
             Ok(result.len())
@@ -173,6 +174,7 @@ impl WriteOperations for MongoDbTransaction<'_> {
                 record_filter,
                 args,
                 UpdateType::One,
+                self.connection.max_time,
             )
             .await?;
             // NOTE: Atomic updates are not yet implemented for MongoDB, so we only return ids.
@@ -202,6 +204,7 @@ impl WriteOperations for MongoDbTransaction<'_> {
             model,
             record_filter,
             limit,
+            self.connection.max_time,
         ))
         .await
     }
@@ -219,6 +222,7 @@ impl WriteOperations for MongoDbTransaction<'_> {
             model,
             record_filter,
             selected_fields,
+            self.connection.max_time,
         ))
         .await
     }
@@ -307,6 +311,7 @@ impl ReadOperations for MongoDbTransaction<'_> {
             model,
             filter,
             selected_fields,
+            self.connection.max_time,
         ))
         .await
     }
@@ -325,6 +330,7 @@ impl ReadOperations for MongoDbTransaction<'_> {
             model,
             query_arguments,
             selected_fields,
+            self.connection.max_time,
         ))
         .await
     }
@@ -340,6 +346,7 @@ impl ReadOperations for MongoDbTransaction<'_> {
             &mut self.connection.session,
             from_field,
             from_record_ids,
+            self.connection.max_time,
         ))
         .await
     }
@@ -361,6 +368,7 @@ impl ReadOperations for MongoDbTransaction<'_> {
             selections,
             group_by,
             having,
+            self.connection.max_time,
         ))
         .await
     }

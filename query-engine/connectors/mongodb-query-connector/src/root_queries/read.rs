@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::{
     IntoBson, error::DecorateErrorWithFieldInformationExtension, output_meta, query_builder::MongoReadQueryBuilder,
@@ -14,6 +16,7 @@ pub async fn get_single_record(
     model: &Model,
     filter: &Filter,
     selected_fields: &FieldSelection,
+    max_time: Option<Duration>,
 ) -> crate::Result<Option<SingleRecord>> {
     let coll = database.collection(model.db_name());
 
@@ -24,7 +27,7 @@ pub async fn get_single_record(
         .with_virtual_fields(selected_fields.virtuals())?
         .build()?;
 
-    let docs = query.execute(coll, session).await?;
+    let docs = query.execute(coll, session, max_time).await?;
 
     if docs.is_empty() {
         Ok(None)
@@ -50,6 +53,7 @@ pub async fn get_many_records(
     model: &Model,
     query_arguments: QueryArguments,
     selected_fields: &FieldSelection,
+    max_time: Option<Duration>,
 ) -> crate::Result<ManyRecords> {
     let coll = database.collection(model.db_name());
 
@@ -68,7 +72,7 @@ pub async fn get_many_records(
         .with_virtual_fields(selected_fields.virtuals())?
         .build()?;
 
-    let docs = query.execute(coll, session).await?;
+    let docs = query.execute(coll, session, max_time).await?;
     for doc in docs {
         let record = document_to_record(doc, &field_names, &meta_mapping)?;
         records.push(record)
@@ -86,6 +90,7 @@ pub async fn get_related_m2m_record_ids(
     session: &mut ClientSession,
     from_field: &RelationFieldRef,
     from_record_ids: &[SelectionResult],
+    max_time: Option<Duration>,
 ) -> crate::Result<Vec<(SelectionResult, SelectionResult)>> {
     if from_record_ids.is_empty() {
         return Ok(vec![]);
@@ -111,7 +116,8 @@ pub async fn get_related_m2m_record_ids(
     let projection = doc! { id_field.db_name(): 1, relation_ids_field_name: 1 };
 
     let query_string_builder = Find::new(&filter, &projection, coll.name());
-    let find_options = FindOptions::builder().projection(projection.clone()).build();
+    let mut find_options = FindOptions::builder().projection(projection.clone()).build();
+    find_options.max_time = max_time;
 
     let cursor = observing(&query_string_builder, || {
         coll.find(filter.clone())

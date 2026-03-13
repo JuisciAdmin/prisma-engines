@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::catch;
 use crate::{
     MongoDbTransaction,
@@ -17,6 +19,9 @@ pub struct MongoDbConnection {
 
     /// Handle to a mongo database.
     pub(crate) database: Database,
+
+    /// Optional server-side query timeout (from connection string `maxTimeMS`).
+    pub(crate) max_time: Option<Duration>,
 }
 
 impl ConnectionLike for MongoDbConnection {}
@@ -105,6 +110,7 @@ impl WriteOperations for MongoDbConnection {
                 record_filter,
                 args,
                 UpdateType::Many { limit },
+                self.max_time,
             )
             .await?;
 
@@ -141,6 +147,7 @@ impl WriteOperations for MongoDbConnection {
                 record_filter,
                 args,
                 UpdateType::One,
+                self.max_time,
             )
             .await?;
 
@@ -171,6 +178,7 @@ impl WriteOperations for MongoDbConnection {
             model,
             record_filter,
             limit,
+            self.max_time,
         ))
         .await
     }
@@ -188,6 +196,7 @@ impl WriteOperations for MongoDbConnection {
             model,
             record_filter,
             selected_fields,
+            self.max_time,
         ))
         .await
     }
@@ -271,6 +280,7 @@ impl ReadOperations for MongoDbConnection {
             model,
             filter,
             selected_fields,
+            self.max_time,
         ))
         .await
     }
@@ -289,6 +299,7 @@ impl ReadOperations for MongoDbConnection {
             model,
             query_arguments,
             selected_fields,
+            self.max_time,
         ))
         .await
     }
@@ -304,6 +315,7 @@ impl ReadOperations for MongoDbConnection {
             &mut self.session,
             from_field,
             from_record_ids,
+            self.max_time,
         ))
         .await
     }
@@ -325,6 +337,7 @@ impl ReadOperations for MongoDbConnection {
             selections,
             group_by,
             having,
+            self.max_time,
         ))
         .await
     }

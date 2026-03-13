@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::error::MongoError::ConversionError;
 use crate::{
@@ -14,7 +16,7 @@ use mongodb::{
     ClientSession, Collection, Database,
     bson::{Document, doc},
     error::ErrorKind,
-    options::InsertManyOptions,
+    options::{FindOneAndDeleteOptions, InsertManyOptions},
 };
 use query_structure::{Model, PrismaValue, SelectionResult};
 use std::future::IntoFuture;
@@ -147,6 +149,7 @@ pub async fn update_records(
     record_filter: RecordFilter,
     mut args: WriteArgs,
     update_type: UpdateType,
+    max_time: Option<Duration>,
 ) -> crate::Result<Vec<SelectionResult>> {
     let coll = database.collection::<Document>(model.db_name());
 
@@ -172,10 +175,10 @@ pub async fn update_records(
             })
             .collect::<crate::Result<Vec<_>>>()?
     } else if let Some(filter) = try_filter_to_native_mql(&record_filter.filter) {
-        find_ids_native(coll.clone(), session, model, filter, None).await?
+        find_ids_native(coll.clone(), session, model, filter, None, max_time).await?
     } else {
         let filter = MongoFilterVisitor::new(FilterPrefix::default(), false).visit(record_filter.filter)?;
-        find_ids(coll.clone(), session, model, filter, None).await?
+        find_ids(coll.clone(), session, model, filter, None, max_time).await?
     };
 
     if ids.is_empty() {
@@ -236,6 +239,7 @@ pub async fn delete_records(
     model: &Model,
     record_filter: RecordFilter,
     limit: Option<usize>,
+    max_time: Option<Duration>,
 ) -> crate::Result<usize> {
     let coll = database.collection::<Document>(model.db_name());
     let id_field = pick_singular_id(model);
@@ -251,10 +255,10 @@ pub async fn delete_records(
             })
             .collect::<crate::Result<Vec<_>>>()?
     } else if let Some(filter) = try_filter_to_native_mql(&record_filter.filter) {
-        find_ids_native(coll.clone(), session, model, filter, limit).await?
+        find_ids_native(coll.clone(), session, model, filter, limit, max_time).await?
     } else {
         let filter = MongoFilterVisitor::new(FilterPrefix::default(), false).visit(record_filter.filter)?;
-        find_ids(coll.clone(), session, model, filter, limit).await?
+        find_ids(coll.clone(), session, model, filter, limit, max_time).await?
     };
 
     if ids.is_empty() {
@@ -277,6 +281,7 @@ pub async fn delete_record(
     model: &Model,
     record_filter: RecordFilter,
     selected_fields: FieldSelection,
+    max_time: Option<Duration>,
 ) -> crate::Result<SingleRecord> {
     let coll = database.collection::<Document>(model.db_name());
     let id_field = pick_singular_id(model);
@@ -306,8 +311,13 @@ pub async fn delete_record(
     };
 
     let query_string_builder = DeleteOne::new(&filter, coll.name());
+    let mut foad_opts = FindOneAndDeleteOptions::default();
+    foad_opts.max_time = max_time;
     let document = observing(&query_string_builder, || {
-        coll.find_one_and_delete(filter.clone()).session(session).into_future()
+        coll.find_one_and_delete(filter.clone())
+            .with_options(foad_opts)
+            .session(session)
+            .into_future()
     })
     .await?
     .ok_or(MongoError::RecordDoesNotExist {
@@ -327,6 +337,7 @@ async fn find_ids(
     model: &Model,
     filter: MongoFilter,
     limit: Option<usize>,
+    max_time: Option<Duration>,
 ) -> crate::Result<Vec<Bson>> {
     let id_field = model.primary_identifier();
     let mut builder = MongoReadQueryBuilder::new(model.clone());
@@ -355,7 +366,7 @@ async fn find_ids(
     }
 
     let query = builder.build()?;
-    let docs = query.execute(collection, session).await?;
+    let docs = query.execute(collection, session, max_time).await?;
     let ids = docs.into_iter().map(|mut doc| doc.remove("_id").unwrap()).collect();
 
     Ok(ids)
@@ -368,6 +379,7 @@ async fn find_ids_native(
     model: &Model,
     filter: Document,
     limit: Option<usize>,
+    max_time: Option<Duration>,
 ) -> crate::Result<Vec<Bson>> {
     let id_field = model.primary_identifier();
     let mut builder = MongoReadQueryBuilder::new(model.clone());
@@ -388,7 +400,7 @@ async fn find_ids_native(
     }
 
     let query = builder.build()?;
-    let docs = query.execute(collection, session).await?;
+    let docs = query.execute(collection, session, max_time).await?;
     let ids = docs.into_iter().map(|mut doc| doc.remove("_id").unwrap()).collect();
 
     Ok(ids)

@@ -11,6 +11,8 @@ use crate::{
     root_queries::observing,
     vacuum_cursor,
 };
+use std::time::Duration;
+
 use bson::{Bson, Document, doc};
 use itertools::Itertools;
 use mongodb::{ClientSession, Collection, options::AggregateOptions};
@@ -36,8 +38,10 @@ impl ReadQuery {
         self,
         on_collection: Collection<Document>,
         with_session: &mut ClientSession,
+        max_time: Option<Duration>,
     ) -> crate::Result<Vec<Document>> {
-        let opts = AggregateOptions::builder().allow_disk_use(true).build();
+        let mut opts = AggregateOptions::builder().allow_disk_use(true).build();
+        opts.max_time = max_time;
         let query_string_builder = Aggregate::new(&self.stages, on_collection.name());
         let cursor = observing(&query_string_builder, || {
             on_collection
@@ -577,6 +581,10 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                     Some(doc! { "$nor": [nested] })
                 }
                 CompositeCondition::IsSet(is_set) => Some(doc! { nested_prefix: { "$exists": *is_set } }),
+                CompositeCondition::Equals(pv) if matches!(pv, PrismaValue::Null) => {
+                    // Native MongoDB: { field: null } matches both explicit null AND missing.
+                    Some(doc! { nested_prefix: Bson::Null })
+                }
                 _ => None,
             }
         }
@@ -612,6 +620,9 @@ fn can_flatten_native_and(natives: &[Document]) -> bool {
 fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Option<Document> {
     let field: &ScalarFieldRef = match &sf.projection {
         ScalarProjection::Single(f) => f,
+        // M2M linking_fields() produces Compound even for single-field PKs like _id.
+        // Handle single-element compound as if it were Single to enable native $in.
+        ScalarProjection::Compound(fields) if fields.len() == 1 => &fields[0],
         ScalarProjection::Compound(_) => return None,
     };
 
@@ -707,11 +718,23 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Opt
                 return None;
             }
             // Native $in with null matches both null + missing — desired semantics.
-            let arr: Vec<Bson> = vals
-                .iter()
-                .map(|v| (field, v.clone()).into_bson())
-                .collect::<Result<_, _>>()
-                .ok()?;
+            //
+            // M2M flattening: The core engine's nested_read.rs wraps each child ID
+            // in PrismaValue::List when constructing ConditionListValue::list(child_ids).
+            // Without flattening, into_bson() converts these to Bson::Array wrappers
+            // (e.g., { _id: { $in: [[ObjectId("...")], ...] } }) which silently match
+            // nothing, causing the $expr fallback to handle M2M queries instead.
+            // We flatten PrismaValue::List → inner scalars so $in gets plain ObjectIds.
+            let mut arr: Vec<Bson> = Vec::with_capacity(vals.len());
+            for v in vals {
+                if let PrismaValue::List(inner) = v {
+                    for scalar in inner {
+                        arr.push((field, scalar.clone()).into_bson().ok()?);
+                    }
+                } else {
+                    arr.push((field, v.clone()).into_bson().ok()?);
+                }
+            }
             Some(doc! { &name: { "$in": arr } })
         }
 
@@ -724,11 +747,17 @@ fn try_scalar_to_native(sf: &qs::ScalarFilter, path_prefix: Option<&str>) -> Opt
             if vals.iter().any(|v| matches!(v, PrismaValue::Null)) {
                 return None;
             }
-            let arr: Vec<Bson> = vals
-                .iter()
-                .map(|v| (field, v.clone()).into_bson())
-                .collect::<Result<_, _>>()
-                .ok()?;
+            // Same M2M PrismaValue::List flattening as In (see above).
+            let mut arr: Vec<Bson> = Vec::with_capacity(vals.len());
+            for v in vals {
+                if let PrismaValue::List(inner) = v {
+                    for scalar in inner {
+                        arr.push((field, scalar.clone()).into_bson().ok()?);
+                    }
+                } else {
+                    arr.push((field, v.clone()).into_bson().ok()?);
+                }
+            }
             Some(doc! { "$and": [
                 { &name: { "$exists": true } },
                 { &name: { "$nin": arr } }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{constants::*, output_meta, query_builder::MongoReadQueryBuilder, value::value_from_bson};
 
 use connector_interface::*;
@@ -12,6 +14,7 @@ pub async fn aggregate(
     selections: Vec<AggregationSelection>,
     group_by: Vec<ScalarFieldRef>,
     having: Option<Filter>,
+    max_time: Option<Duration>,
 ) -> crate::Result<Vec<AggregationRow>> {
     let is_group_by = !group_by.is_empty();
     let coll = database.collection(model.db_name());
@@ -20,7 +23,7 @@ pub async fn aggregate(
         .with_groupings(group_by, &selections, having)?
         .build()?;
 
-    let docs = query.execute(coll, session).await?;
+    let docs = query.execute(coll, session, max_time).await?;
 
     if is_group_by && docs.is_empty() {
         Ok(vec![])

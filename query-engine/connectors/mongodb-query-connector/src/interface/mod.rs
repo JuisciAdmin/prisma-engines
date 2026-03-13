@@ -5,6 +5,8 @@ mod utils;
 pub use connection::*;
 pub use transaction::*;
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use connector_interface::{
     Connector,
@@ -24,11 +26,15 @@ pub struct MongoDb {
 
     /// The database used for all connections.
     database: String,
+
+    /// Optional server-side query timeout extracted from `maxTimeMS` in the
+    /// connection string. Applied to every read and applicable write operation.
+    max_time: Option<Duration>,
 }
 
 impl MongoDb {
     pub async fn new(_source: &Datasource, url: &str) -> connector_interface::Result<Self> {
-        let client = mongodb_client::create(&url).await.map_err(|err| {
+        let (client, max_time) = mongodb_client::create(&url).await.map_err(|err| {
             let kind = match err.kind {
                 mongodb_client::ErrorKind::InvalidArgument { message } => ErrorKind::InvalidDatabaseUrl {
                     details: format!("MongoDB connection string error: {message}"),
@@ -45,7 +51,11 @@ impl MongoDb {
             .map(|d| d.name().to_owned())
             .unwrap_or_default();
 
-        Ok(Self { client, database })
+        Ok(Self {
+            client,
+            database,
+            max_time,
+        })
     }
 
     pub fn db_name(&self) -> &str {
@@ -67,6 +77,7 @@ impl Connector for MongoDb {
         Ok(Box::new(MongoDbConnection {
             session,
             database: self.client.database(&self.database),
+            max_time: self.max_time,
         }))
     }
 
