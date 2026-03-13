@@ -581,10 +581,18 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                     Some(doc! { "$nor": [nested] })
                 }
                 CompositeCondition::IsSet(is_set) => Some(doc! { nested_prefix: { "$exists": *is_set } }),
-                CompositeCondition::Equals(pv) if matches!(pv, PrismaValue::Null) => {
-                    // Native MongoDB: { field: null } matches both explicit null AND missing.
-                    Some(doc! { nested_prefix: Bson::Null })
-                }
+                CompositeCondition::Equals(pv) => match pv {
+                    PrismaValue::Null => {
+                        // Native MongoDB: { field: null } matches both explicit null AND missing.
+                        Some(doc! { nested_prefix: Bson::Null })
+                    }
+                    PrismaValue::Object(pairs) => {
+                        // Dot-notation partial matching: { "field.key": val }
+                        // instead of exact BSON equality which misses docs with extra fields.
+                        flatten_composite_to_native(&nested_prefix, &cf.field, pairs)
+                    }
+                    _ => None,
+                },
                 _ => None,
             }
         }
@@ -611,6 +619,63 @@ fn can_flatten_native_and(natives: &[Document]) -> bool {
     }
 
     true
+}
+
+/// Flatten a PrismaValue::Object into dot-notation equality conditions for native MQL.
+///
+/// Converts `{ "prefix.key1": val1, "prefix.key2": val2 }` for partial composite matching.
+/// Recursively handles nested composite objects.
+///
+/// Returns None (falling back to $expr) for unsupported PrismaValue variants.
+fn flatten_composite_to_native(
+    prefix: &str,
+    cf: &query_structure::CompositeFieldRef,
+    pairs: &[(String, PrismaValue)],
+) -> Option<Document> {
+    let composite_type = cf.typ();
+    let mut conditions: Vec<Document> = Vec::new();
+
+    for (key, value) in pairs {
+        let field = composite_type.find_field(key)?;
+        let dotted = format!("{}.{}", prefix, field.db_name());
+
+        match value {
+            PrismaValue::Null => conditions.push(doc! { &dotted: Bson::Null }),
+            PrismaValue::Object(nested) => {
+                // Recurse for nested composites
+                match &field {
+                    query_structure::Field::Composite(nested_cf) => {
+                        conditions.push(flatten_composite_to_native(&dotted, nested_cf, nested)?);
+                    }
+                    _ => return None,
+                }
+            }
+            scalar => {
+                // For scalar fields, use type-aware conversion
+                match &field {
+                    query_structure::Field::Scalar(sf) => {
+                        let bson_val = (sf, scalar.clone()).into_bson().ok()?;
+                        conditions.push(doc! { &dotted: bson_val });
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    if conditions.is_empty() {
+        return Some(Document::new());
+    }
+
+    if can_flatten_native_and(&conditions) {
+        let mut merged = Document::new();
+        for d in conditions {
+            merged.extend(d);
+        }
+        Some(merged)
+    } else {
+        Some(doc! { "$and": conditions })
+    }
 }
 
 /// Convert a single ScalarFilter to native MQL.

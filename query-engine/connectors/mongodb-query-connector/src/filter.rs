@@ -587,8 +587,35 @@ impl MongoFilterVisitor {
                 none
             }
 
-            CompositeCondition::Equals(value) => {
-                doc! { "$eq": [&field_name, (&field, value).into_bson()?] }
+            CompositeCondition::Equals(value) => match &value {
+                PrismaValue::Object(pairs) => {
+                    // Dot-notation comparison even in $expr context to avoid
+                    // exact BSON equality which misses docs with extra fields.
+                    let composite_type = field.typ();
+                    let field_name_str = match &field_name {
+                        Bson::String(s) => s.clone(),
+                        _ => return Err(MongoError::Unsupported(
+                            "Non-string field name in composite equals".to_owned(),
+                        )),
+                    };
+                    // Strip leading '$' to get the base path for reconstruction
+                    let base_path = field_name_str.strip_prefix('$').unwrap_or(&field_name_str);
+                    let mut conds = Vec::new();
+                    for (key, val) in pairs {
+                        let nested_field = composite_type.find_field(key).ok_or_else(|| {
+                            MongoError::Unsupported(format!("Unknown composite field: {key}"))
+                        })?;
+                        let dotted_ref = format!("${}.{}", base_path, nested_field.db_name());
+                        let bson_val = (&nested_field, val.clone()).into_bson()?;
+                        conds.push(doc! { "$eq": [&dotted_ref, bson_val] });
+                    }
+                    if conds.len() == 1 {
+                        conds.into_iter().next().unwrap()
+                    } else {
+                        doc! { "$and": conds }
+                    }
+                }
+                _ => doc! { "$eq": [&field_name, (&field, value).into_bson()?] },
             }
 
             CompositeCondition::Empty(should_be_empty) => {
