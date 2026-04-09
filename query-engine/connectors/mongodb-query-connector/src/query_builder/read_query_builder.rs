@@ -593,6 +593,9 @@ fn try_to_native_filter_with_prefix(filter: &Filter, path_prefix: Option<&str>) 
                     }
                     _ => None,
                 },
+                // isEmpty on composite arrays — same MQL as scalar arrays
+                CompositeCondition::Empty(true) => Some(doc! { &nested_prefix: { "$size": 0_i32 } }),
+                CompositeCondition::Empty(false) => Some(doc! { format!("{}.0", &nested_prefix): { "$exists": true } }),
                 _ => None,
             }
         }
